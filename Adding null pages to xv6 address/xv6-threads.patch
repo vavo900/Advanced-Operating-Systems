@@ -1,0 +1,379 @@
+diff -ruN src/defs.h src-finished/defs.h
+--- src/defs.h	2019-09-25 20:28:16.000000000 -0700
++++ src-finished/defs.h	2022-07-02 17:13:52.000000000 -0700
+@@ -120,6 +120,8 @@
+ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
++int		        clone(void(*)(void*, void*), void*, void*, void*);
++int		        join(void**);
+ 
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+diff -ruN src/proc.c src-finished/proc.c
+--- src/proc.c	2019-09-25 20:28:16.000000000 -0700
++++ src-finished/proc.c	2022-07-03 14:47:19.000000000 -0700
+@@ -255,9 +255,19 @@
+   // Pass abandoned children to init.
+   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+     if(p->parent == curproc){
+-      p->parent = initproc;
+-      if(p->state == ZOMBIE)
+-        wakeup1(initproc);
++      if (p->pgdir != curproc->pgdir)
++      {
++        p->parent = initproc;
++
++        if(p->state == ZOMBIE)
++          wakeup1(initproc);
++      }
++      else
++      {
++
++        p->parent = 0;
++        p->state = ZOMBIE;
++      }
+     }
+   }
+ 
+@@ -283,6 +293,8 @@
+     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+       if(p->parent != curproc)
+         continue;
++      if(p->pgdir == curproc->pgdir && p->pid != 0 && p->state == ZOMBIE)
++        continue;
+       havekids = 1;
+       if(p->state == ZOMBIE){
+         // Found one.
+@@ -532,3 +544,114 @@
+     cprintf("\n");
+   }
+ }
++
++int 
++clone(void(*fcn)(void *, void *), void *arg1, void *arg2, void *stack)
++{ 
++  
++  int i, pid;
++  struct proc *np;
++  struct proc *curproc = myproc();
++  
++  if((curproc->sz - (uint)stack) < PGSIZE)
++  {
++    return -1;
++  }
++
++  if ((uint)stack % PGSIZE != 0)
++  {
++    return -1;
++  }
++  
++  if((np = allocproc()) == 0)
++  {
++    return -1;
++  }
++
++ 
++  np->pgdir = curproc->pgdir;
++  np->sz = curproc->sz;
++
++  np->parent = curproc;
++  *np->tf = *curproc->tf;
++
++  np->tf->esp = (uint)stack + PGSIZE;
++  np->tstack = (uint)stack;
++
++  int us_stk[3];
++
++  us_stk[0] = 0xffffffff;  
++  us_stk[1] = (uint)arg1;
++  us_stk[2] = (uint)arg2;
++
++  np->tf->esp -= (3)*sizeof(uint);
++  copyout(np->pgdir, np->tf->esp, us_stk, (3)*sizeof(uint));
++
++
++  np->tf->eax = 0;
++  
++  np->tf->eip = (uint)fcn;
++  np->tf->ebp = np->tf->esp;
++
++  for(i = 0; i < NOFILE; i++)
++    if(curproc->ofile[i])
++      np->ofile[i] = filedup(curproc->ofile[i]);
++
++  np->cwd = idup(curproc->cwd);
++
++  safestrcpy(np->name, curproc->name, sizeof(curproc->name));
++  pid = np->pid;
++  acquire(&ptable.lock);
++  np->state = RUNNABLE;
++  release(&ptable.lock);
++
++  return pid;
++}
++
++
++int 
++join(void **stack)
++{
++  struct proc *p;
++  int srch_thrds, pid;
++
++  struct proc *curproc = myproc();
++
++  acquire(&ptable.lock);
++
++  for(;;){
++    
++    srch_thrds = 0;
++
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++      
++      if(p->pgdir != curproc->pgdir) 
++        continue;
++
++      if(p->parent != curproc)
++        continue;
++      srch_thrds = 1;
++
++      if(p->state == ZOMBIE){
++        
++        pid = p->pid;
++        p->pid = 0;
++        p->killed = 0;
++        p->parent = 0;
++        p->name[0] = 0;
++        p->state = UNUSED;
++        *((int*)((int*)stack)) = p->tstack;
++
++        release(&ptable.lock);
++        return pid;
++      }
++    }
++
++    if(!srch_thrds || curproc->killed){
++      release(&ptable.lock);
++      return -1;
++    }
++
++    sleep(curproc, &ptable.lock);  
++  }
++} 
+diff -ruN src/proc.h src-finished/proc.h
+--- src/proc.h	2019-09-25 20:28:16.000000000 -0700
++++ src-finished/proc.h	2022-07-02 17:17:57.000000000 -0700
+@@ -49,6 +49,7 @@
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  uint tstack; 
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+diff -ruN src/syscall.c src-finished/syscall.c
+--- src/syscall.c	2019-09-25 20:28:16.000000000 -0700
++++ src-finished/syscall.c	2022-07-03 14:26:36.000000000 -0700
+@@ -103,6 +103,8 @@
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_clone(void);
++extern int sys_join(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +128,8 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_clone]   sys_clone,    
++[SYS_join]    sys_join , 
+ };
+ 
+ void
+diff -ruN src/syscall.h src-finished/syscall.h
+--- src/syscall.h	2019-09-25 20:28:16.000000000 -0700
++++ src-finished/syscall.h	2022-07-02 17:18:59.000000000 -0700
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_clone  22
++#define SYS_join   23
+diff -ruN src/sysproc.c src-finished/sysproc.c
+--- src/sysproc.c	2019-09-25 20:28:16.000000000 -0700
++++ src-finished/sysproc.c	2022-07-03 14:50:09.000000000 -0700
+@@ -89,3 +89,49 @@
+   release(&tickslock);
+   return xticks;
+ }
++
++int 
++sys_clone(void)
++{
++  void (*fcn)(void *, void *);
++  void *arg1;
++  void *arg2;
++  void *stack;
++
++  if(argptr(0, (void*)&fcn, sizeof(void*)) < 0)
++  {
++    return -1;
++  }
++
++  if(argint(1, (void*)&arg1) < 0)
++  {  
++    return -1;
++  }
++
++  if(argint(2, (void*)&arg2) < 0)
++  {
++    return -1;
++  }
++
++  if(argptr(3, (void*)&stack, sizeof(void*)) < 0)
++  {
++    return -1;
++  }
++
++
++  return clone(fcn, arg1, arg2, stack);
++}
++
++int 
++sys_join(void)
++{
++   void **stack;
++
++  if(argptr(0, (void*)&stack, sizeof(void**)) < 0)
++  {
++    return -1;
++  }
++
++
++  return join(stack);
++}
+diff -ruN src/test_6.c src-finished/test_6.c
+--- src/test_6.c	2022-03-21 13:04:40.000000000 -0700
++++ src-finished/test_6.c	2022-07-03 15:09:36.465268139 -0700
+@@ -20,8 +20,6 @@
+ /*testing clone() and join() system call with a simple thread function.*/
+ int main(int argc, char *argv[])
+ {
+-  lock_init(&mylock);
+-
+   int i = 0;
+   printf(1, "XV6_TEST_OUTPUT : i before threadfunc = %x\n", i);
+ 
+diff -ruN src/types.h src-finished/types.h
+--- src/types.h	2019-09-25 20:28:16.000000000 -0700
++++ src-finished/types.h	2022-07-03 14:50:53.000000000 -0700
+@@ -2,3 +2,7 @@
+ typedef unsigned short ushort;
+ typedef unsigned char  uchar;
+ typedef uint pde_t;
++typedef struct __lock_t {
++    uint ticket; 
++} lock_t;
++
+diff -ruN src/ulib.c src-finished/ulib.c
+--- src/ulib.c	2019-09-25 20:28:16.000000000 -0700
++++ src-finished/ulib.c	2022-07-03 15:01:48.000000000 -0700
+@@ -104,3 +104,66 @@
+     *dst++ = *src++;
+   return vdst;
+ }
++
++int 
++thread_create(void (*start_routine)(void*, void*), void *arg1, void *arg2)
++{
++  const int pg_sz = 4096;
++
++  lock_t lk;
++
++	lock_init(&lk);
++	lock_acquire(&lk);
++
++  void *stk = malloc(pg_sz*2);
++  lock_release(&lk);
++
++  if((uint)stk % pg_sz != 0)
++  {
++    stk += (pg_sz - ((uint)stk % pg_sz));
++  }
++  
++
++  int thr = clone(start_routine, arg1, arg2, stk);
++  return thr;
++}
++
++int 
++thread_join()
++{
++  void* stk = malloc(sizeof(void*));
++  int thr = join(&stk);
++
++  lock_t lk;
++
++	lock_init(&lk);
++	lock_acquire(&lk);
++
++	free(stk);
++	lock_release(&lk);
++
++	return thr;
++}
++
++int 
++lock_init(lock_t *lk)
++{ 
++
++  lk->ticket = 0;
++
++  return 0;
++}
++
++void 
++lock_acquire(lock_t *lk)
++{
++  while(xchg(&lk->ticket, 1) != 0)
++	{}
++}
++
++void 
++lock_release(lock_t *lk)
++{
++  xchg(&lk->ticket, 0);
++}
++
+diff -ruN src/user.h src-finished/user.h
+--- src/user.h	2019-09-25 20:28:16.000000000 -0700
++++ src-finished/user.h	2022-07-02 17:22:18.000000000 -0700
+@@ -23,6 +23,8 @@
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int clone(void(*fcn)(void*, void*), void *arg1, void *arg2, void *stack);
++int join(void **stack);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+@@ -37,3 +39,8 @@
+ void* malloc(uint);
+ void free(void*);
+ int atoi(const char*);
++int thread_create(void (*)(void*, void*), void *, void *);
++int thread_join();
++int lock_init(lock_t *lock);
++void lock_acquire(lock_t *lock);
++void lock_release(lock_t *lock);
+diff -ruN src/usys.S src-finished/usys.S
+--- src/usys.S	2019-09-25 20:28:16.000000000 -0700
++++ src-finished/usys.S	2022-07-02 17:48:02.000000000 -0700
+@@ -29,3 +29,5 @@
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(clone)
++SYSCALL(join)
